@@ -1,0 +1,262 @@
+---
+title: "Anàlisi de dades òmiques - PAC1"
+author: Martina Pérez
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+
+
+## Importació de les dades
+
+```{r dades}
+# Llegim les dades
+library(readxl)
+library(knitr)
+
+# Data frame dades
+count_matrix <- read_excel("GastricCancer_NMR.xlsx")
+count_matrix <- count_matrix[, c(5:153)]
+
+# Data frame dades metabolomics
+metabolomics_metadata <- read_excel("GastricCancer_NMR.xlsx", sheet = "Peak")
+
+# Data frame dades mostres
+sample_metadata <- read_excel("GastricCancer_NMR.xlsx")
+sample_metadata <- sample_metadata[, c(1:4)]
+
+
+# Comprovem que coincideixen
+stopifnot(rownames(count_matrix) == sample_metadata$Idx)
+stopifnot(colnames(count_matrix) == metabolomics_metadata$Name)
+```
+
+### Estadística descriptiva
+
+Primer de tot, li donem una ullada al conjunt de dades utilitzant el resum bàsic estadístic.
+
+```{r descriptiva}
+
+str(count_matrix, list.len = 10)
+summary(count_matrix)[,1:10]
+
+str(metabolomics_metadata)
+summary(metabolomics_metadata)
+
+sample_metadata$SampleType <- as.factor(sample_metadata$SampleType)
+sample_metadata$Class <- as.factor(sample_metadata$Class)
+str(sample_metadata)
+summary(sample_metadata)
+
+par(mfrow = c(3,3))
+sapply(names(count_matrix), function(var) {
+  hist(count_matrix[[var]], main = var)
+})
+
+
+```
+
+
+
+
+
+
+## Objecte SummarizedExperiment
+
+```{r SummarizedExperiment}
+# BiocManager::install("SummarizedExperiment")
+library(SummarizedExperiment)
+se <- SummarizedExperiment(assays = list(counts = count_matrix),
+                           colData = metabolomics_metadata,
+                           rowData = sample_metadata,
+                           metadata = list(
+                             dataset = "Dataset del projecte PR000699 sobre el perfil metabolòmic urinari pel diagnòstic del càncer gàstric",
+                             filas = "Hi ha 140 files on es representen les mostres d'orina",
+                             columnas = "Hi ha 149 columnes que són les concentracions metabolòmiques"
+                           ))
+se
+# Guardem l'objecte a un arxiu .Rdat
+save(se, file = "metabolomics_data.Rdat")
+
+se_summary <- function(se) {
+  cat("Dimensions de la matriu de dades (assays):", dim(assay(se)), "\n")
+  cat("Dimensions de colData:", dim(colData(se)), "\n")
+  cat("Dimensions de rowData:", dim(rowData(se)), "\n")
+  cat("\nPrimeres files de colData:\n")
+  print(head(colData(se)))
+  cat("\nPrimeres files de rowData:\n")
+  print(head(rowData(se)))
+  cat("\nDistribució de classes:\n")
+  print(table(rowData(se)$Class))
+}
+se_summary(se)
+```
+
+
+
+
+## Anàlisi exploratori
+
+Abans de fer l'anàlisi exploratori, comprovem que no hi ha valors faltants. Si n'hi ha, els imputem amb la mediana.
+```{r analisi explotari}
+if(any(is.na(count_matrix))) {
+  for(i in 1:ncol(count_matrix)) {
+    count_matrix[is.na(count_matrix[,i]), i] <- sapply(count_matrix[,i], median, na.rm = TRUE)
+  }
+}
+```
+
+
+
+
+### PCA
+Realitzem l'anàlisi de components principals:
+
+```{r PCA}
+# Escalem les dades
+count_matrix_scale <- scale(count_matrix)
+
+# PCA
+pca <- prcomp(count_matrix_scale, center = FALSE, scale. = TRUE)
+
+# Calculem el percentatge de variancia explicada per cada component
+variancia_explicada <- pca$sdev^2 / sum(pca$sdev^2) * 100
+variancia_acumulada <- cumsum(variancia_explicada)
+
+
+resum_variança <- data.frame(
+  PC = 1:20,
+  Variancia = variancia_explicada[1:20],
+  Acumulada = variancia_acumulada[1:20]
+)
+kable(resum_variança)
+
+
+
+# Creem un dataframe para veure gràficament el PCA
+pca_df <- as.data.frame(pca$x[, 1:5])  # Guardem només els 5 primers components 
+pca_df$SampleType <- sample_metadata$SampleType
+pca_df$Class <- sample_metadata$Class
+
+library(ggrepel)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Class, shape = SampleType)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    title = "PCA de dades metabolòmics",
+    x = paste0("PC1 (", round(variancia_explicada[1], 1), "%)"),
+    y = paste0("PC2 (", round(variancia_explicada[2], 1), "%)")
+  ) +
+  geom_text_repel(aes(label = rownames(pca_df)), size = 2.5, max.overlaps = 10)
+
+
+
+# Scree plot
+barplot(variancia_explicada[1:50], 
+        names.arg = 1:50,
+        main = "Variancia explicada pels primers 50 components",
+        xlab = "Component Principal",
+        ylab = "Percentatge de variancia",
+        col = "lightblue")
+lines(variancia_explicada[1:50], type = "b", pch = 20)
+```
+
+
+
+
+
+### Clusters
+Realitzem l'anàlisi de clusters:
+
+```{r cluster}
+dist_matriz <- dist(count_matrix_scale, method = "euclidean")
+hc <- hclust(dist_matriz, method = "ward.D2")
+
+
+
+# Dendrograma amb 3 clusters
+plot(hc, main = "Clustering jeràrquic de les mostres", 
+     xlab = "", ylab = "Disància", sub = "",
+     labels = FALSE, hang = -1)
+rect.hclust(hc, k = 3, border = "red")
+
+
+# Veiem cuantes mostres hi ha a cada cluster
+k <- 3
+clusters <- cutree(hc, k = k)
+kable(table(clusters))
+
+
+pca_df$Cluster <- as.factor(clusters)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Cluster, shape = Class)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_bw() +
+  labs(
+    title = "PCA amb els 3 clusters",
+    x = paste0("PC1 (", round(variancia_explicada[1], 1), "%)"),
+    y = paste0("PC2 (", round(variancia_explicada[2], 1), "%)")
+  )
+
+
+# Relació entre els clusters i la classe
+tabla_cluster_clase <- table(clusters, sample_metadata$Class)
+tabla_cluster_clase
+
+
+# Visualizar esta relación con un gráfico de barras
+tabla_df <- as.data.frame(tabla_cluster_clase)
+names(tabla_df) <- c("Cluster", "Class", "Count")
+
+ggplot(tabla_df, aes(x = Cluster, y = Count, fill = Class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw() +
+  labs(
+    title = "Distribució de classes a cada cluster",
+    x = "Cluster",
+    y = "Número de mostres"
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
